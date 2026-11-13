@@ -105,7 +105,7 @@ const css = `
 `;
 
 function Sparkline({ data, width = 270, height = 40, color = "var(--teal)" }) {
-  if (!data?.length) return null;
+  if (!data || data.length < 2) return <div style={{ height }} />;
   const min = Math.min(...data);
   const max = Math.max(...data);
   const range = max - min || 1;
@@ -276,6 +276,79 @@ function useCameraPermission(enabled) {
   return { status, error, stream, request, cameras, activeId };
 }
 
+/**
+ * Live speed from the device's GPS (Geolocation API).
+ * Works best on phones; laptops usually report no speed.
+ * Status: "checking" | "granted" | "denied" | "unsupported" | "error"
+ */
+function useGpsSpeed(enabled, limit) {
+  const [state, setState] = useState({ kmh: 0, history: [], max: 0, overSec: 0, status: "checking" });
+  const last = useRef(null);
+  const limitRef = useRef(limit);
+  limitRef.current = limit;
+
+  useEffect(() => {
+    if (!enabled) return;
+    if (!window.isSecureContext || !navigator.geolocation) {
+      setState((s) => ({ ...s, status: "unsupported" }));
+      return;
+    }
+
+    const id = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, speed, accuracy } = pos.coords;
+        const prev = last.current;
+        const dt = prev ? (pos.timestamp - prev.t) / 1000 : 0;
+        let ms = speed; // metres per second, may be null
+
+        // No speed from the device: work it out from the previous fix.
+        if (ms == null && prev && dt > 0 && accuracy < 30) {
+          ms = haversine(prev.lat, prev.lon, latitude, longitude) / dt;
+        }
+        last.current = { lat: latitude, lon: longitude, t: pos.timestamp };
+
+        setState((s) => {
+          if (ms == null || ms < 0) return { ...s, status: "granted" };
+          const kmh = Math.round(ms * 3.6);
+          return {
+            status: "granted",
+            kmh,
+            history: [...s.history.slice(-59), kmh],
+            max: Math.max(s.max, kmh),
+            overSec: s.overSec + (kmh > limitRef.current && dt < 10 ? dt : 0),
+          };
+        });
+      },
+      (e) => setState((s) => ({ ...s, status: e.code === e.PERMISSION_DENIED ? "denied" : "error" })),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [enabled]);
+
+  return state;
+}
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+const fmtDuration = (sec) => {
+  const s = Math.round(sec);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
+const GPS_MESSAGES = {
+  checking: "Waiting for GPS…",
+  denied: "Location blocked · allow it in the address bar",
+  unsupported: "GPS needs HTTPS",
+  error: "No GPS signal",
+};
+
 function VideoFeed({ videoSrc, useWebcam }) {
   const ref = useRef(null);
   const cam = useCameraPermission(useWebcam);
@@ -370,7 +443,23 @@ export default function DashcamVision({
   road = DEFAULTS.road,
   stopSigns = DEFAULTS.stopSigns,
   closeCalls = DEFAULTS.closeCalls,
+  useGps = true, // set false to show the `speed` prop instead of live GPS
 }) {
+  const gps = useGpsSpeed(useGps, speed.limit);
+  const gpsLive = useGps && gps.status === "granted";
+  const shownSpeed = !useGps
+    ? speed
+    : {
+        ...speed,
+        current: gpsLive ? gps.kmh : "--",
+        history: gps.history,
+        avg: gps.history.length
+          ? Math.round(gps.history.reduce((a, b) => a + b, 0) / gps.history.length)
+          : "--",
+        max: gps.history.length ? gps.max : "--",
+        overLimit: fmtDuration(gps.overSec),
+      };
+
   return (
     <div className="dv-root">
       <style>{css}</style>
@@ -406,15 +495,23 @@ export default function DashcamVision({
         <div className="dv-card">
           <h3>Driver speed</h3>
           <div className="dv-speed-top">
-            <div className="dv-speed-num">{speed.current}<span>km/h</span></div>
-            <div className="dv-limit">{speed.limit}</div>
+            <div
+              className="dv-speed-num"
+              style={gpsLive && shownSpeed.current > shownSpeed.limit ? { color: "var(--bad)" } : undefined}
+            >
+              {shownSpeed.current}<span>km/h</span>
+            </div>
+            <div className="dv-limit">{shownSpeed.limit}</div>
           </div>
-          <Sparkline data={speed.history} />
+          <Sparkline data={shownSpeed.history} />
           <div className="dv-speed-foot">
-            <span>Avg {speed.avg}</span>
-            <span>Max {speed.max}</span>
-            <span className="over">Over limit {speed.overLimit}</span>
+            <span>Avg {shownSpeed.avg}</span>
+            <span>Max {shownSpeed.max}</span>
+            <span className="over">Over limit {shownSpeed.overLimit}</span>
           </div>
+          {useGps && !gpsLive && (
+            <div className="dv-speed-foot" style={{ marginTop: 8 }}>{GPS_MESSAGES[gps.status]}</div>
+          )}
         </div>
 
         <div className="dv-card">
