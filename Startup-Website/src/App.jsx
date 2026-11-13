@@ -1,7 +1,7 @@
 import DashcamVision from './DashcamVision'
 
 function App() {
-  return <DashcamVision videoSrc="/trip.mp4" />
+  return <DashcamVision useWebcam={true} />
 }
 
 export default App
