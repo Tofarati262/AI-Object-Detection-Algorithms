@@ -171,7 +171,7 @@ function useCameraPermission(enabled) {
     setError(null);
     try {
       const s = await navigator.mediaDevices.getUserMedia({
-        video: { ideal: "environment" }, // rear camera on phones
+        video: { facingMode: {ideal: "environment" }}, // rear camera on phones
         audio: false,
       });
       stop();
