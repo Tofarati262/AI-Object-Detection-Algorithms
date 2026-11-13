@@ -91,6 +91,14 @@ const css = `
 .dv-ev{display:flex;justify-content:space-between;font-size:11px;background:var(--panel-2);border:1px solid var(--line);
   border-radius:4px;padding:7px 9px;margin-top:6px}
 .dv-ev time{margin-right:8px}
+.dv-perm{display:flex;flex-direction:column;align-items:center;gap:10px;max-width:320px}
+.dv-perm svg{width:32px;height:32px;color:var(--teal)}
+.dv-perm p{margin:0;color:var(--text)}
+.dv-perm small{font-size:11px;color:var(--muted)}
+.dv-btn{font:inherit;font-size:12px;font-weight:600;color:#fff;background:var(--accent);border:0;border-radius:4px;
+  padding:8px 14px;cursor:pointer}
+.dv-btn:hover{filter:brightness(1.1)}
+.dv-btn:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 @media (max-width:900px){.dv-root{grid-template-columns:1fr}}
 `;
 
@@ -132,39 +140,179 @@ function CloudSunIcon() {
   );
 }
 
+/**
+ * Camera permission states:
+ *  "checking"    – reading current permission on mount
+ *  "prompt"      – not decided yet → show "Allow camera" button
+ *  "requesting"  – browser permission dialog is open
+ *  "granted"     – stream is live
+ *  "denied"      – user (or browser policy) blocked the camera
+ *  "unsupported" – no getUserMedia (old browser or non-HTTPS page)
+ *  "error"       – no camera found, camera busy, etc.
+ */
+function useCameraPermission(enabled) {
+  const [status, setStatus] = useState("checking");
+  const [error, setError] = useState(null);
+  const [stream, setStream] = useState(null);
+  const streamRef = useRef(null);
+
+  const stop = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    setStream(null);
+  };
+
+  const request = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus("unsupported");
+      return;
+    }
+    setStatus("requesting");
+    setError(null);
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" }, // rear camera on phones
+        audio: false,
+      });
+      stop();
+      streamRef.current = s;
+      setStream(s);
+      setStatus("granted");
+    } catch (e) {
+      if (e.name === "NotAllowedError" || e.name === "SecurityError") {
+        setStatus("denied");
+      } else {
+        setStatus("error");
+        setError(
+          e.name === "NotFoundError"
+            ? "No camera found on this device"
+            : e.name === "NotReadableError"
+            ? "Camera is in use by another app"
+            : e.message || "Camera unavailable"
+        );
+      }
+    }
+  };
+
+  // On mount: ask for the camera straight away (opens the browser's permission prompt),
+  // unless the user has already blocked it.
+  useEffect(() => {
+    if (!enabled) return;
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      setStatus("unsupported");
+      return;
+    }
+    // Page embedded in an iframe without allow="camera" → browser never shows a prompt.
+    const policy = document.permissionsPolicy || document.featurePolicy;
+    if (policy?.allowsFeature && !policy.allowsFeature("camera")) {
+      setStatus("error");
+      setError('This page is inside a frame that blocks the camera. Open it in its own tab, or add allow="camera" to the iframe.');
+      return;
+    }
+    let cancelled = false;
+    let permStatus;
+    const onChange = () => {
+      if (permStatus.state === "denied") { stop(); setStatus("denied"); }
+      else if (permStatus.state === "prompt") { stop(); setStatus("prompt"); }
+    };
+    if (!navigator.permissions?.query) {
+      request();
+    } else {
+      navigator.permissions
+        .query({ name: "camera" })
+        .then((p) => {
+          if (cancelled) return;
+          permStatus = p;
+          p.addEventListener("change", onChange);
+          if (p.state === "denied") setStatus("denied");
+          else request(); // "prompt" → browser shows its permission popup; "granted" → starts immediately
+        })
+        .catch(() => !cancelled && request()); // some browsers don't support querying "camera"
+    }
+    return () => {
+      cancelled = true;
+      permStatus?.removeEventListener("change", onChange);
+      stop();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
+
+  return { status, error, stream, request };
+}
+
 function VideoFeed({ videoSrc, useWebcam }) {
   const ref = useRef(null);
-  const [error, setError] = useState(null);
+  const cam = useCameraPermission(useWebcam);
 
   useEffect(() => {
-    if (!useWebcam) return;
-    let stream;
-    navigator.mediaDevices
-      ?.getUserMedia({ video: { facingMode: "environment" }, audio: false })
-      .then((s) => {
-        stream = s;
-        if (ref.current) ref.current.srcObject = s;
-      })
-      .catch((e) => setError(e.message || "Camera unavailable"));
-    return () => stream?.getTracks().forEach((t) => t.stop());
-  }, [useWebcam]);
+    if (ref.current) ref.current.srcObject = cam.stream;
+  }, [cam.stream]);
 
-  const hasSource = useWebcam || videoSrc;
-  return (
-    <>
-      {hasSource && (
-        <video ref={ref} src={useWebcam ? undefined : videoSrc} autoPlay muted loop playsInline />
-      )}
-      {(!hasSource || error) && (
-        <div className="dv-empty">{error ? `Camera error: ${error}` : "No video source connected"}</div>
-      )}
-    </>
+  if (useWebcam) {
+    return (
+      <>
+        <video ref={ref} autoPlay muted playsInline />
+        {cam.status !== "granted" && (
+          <div className="dv-empty">
+            <CameraPrompt {...cam} />
+          </div>
+        )}
+      </>
+    );
+  }
+
+  return videoSrc ? (
+    <video src={videoSrc} autoPlay muted loop playsInline />
+  ) : (
+    <div className="dv-empty">No video source connected</div>
   );
+}
+
+function CameraPrompt({ status, error, request }) {
+  switch (status) {
+    case "checking":
+      return <p>Checking camera access…</p>;
+    case "prompt":
+      return (
+        <div className="dv-perm">
+          <CameraIcon />
+          <p>Dashcam Vision needs your camera to show the live road feed.</p>
+          <button className="dv-btn" onClick={request}>Allow camera access</button>
+          <small>Video stays on this device.</small>
+        </div>
+      );
+    case "requesting":
+      return <p>Waiting for permission… check your browser's prompt.</p>;
+    case "denied":
+      return (
+        <div className="dv-perm">
+          <p>Camera access is blocked.</p>
+          <small>
+            Click the camera or lock icon in the address bar, set Camera to "Allow", then retry.
+          </small>
+          <button className="dv-btn" onClick={request}>Try again</button>
+        </div>
+      );
+    case "unsupported":
+      return (
+        <div className="dv-perm">
+          <p>Camera isn't available here.</p>
+          <small>Open the dashboard over HTTPS (or localhost) in a recent browser.</small>
+        </div>
+      );
+    default:
+      return (
+        <div className="dv-perm">
+          <p>Camera error: {error}</p>
+          <button className="dv-btn" onClick={request}>Retry</button>
+        </div>
+      );
+  }
 }
 
 export default function DashcamVision({
   videoSrc,
-  useWebcam = false,
+  useWebcam = !videoSrc, // no video file passed → use the webcam
   live = true,
   trip = DEFAULTS.trip,
   weather = DEFAULTS.weather,
