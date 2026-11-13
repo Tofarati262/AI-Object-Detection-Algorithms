@@ -91,6 +91,8 @@ const css = `
 .dv-ev{display:flex;justify-content:space-between;font-size:11px;background:var(--panel-2);border:1px solid var(--line);
   border-radius:4px;padding:7px 9px;margin-top:6px}
 .dv-ev time{margin-right:8px}
+.dv-cam-select{bottom:10px;left:10px;padding:5px 8px;font:inherit;font-size:11px;color:var(--text);cursor:pointer;max-width:60%}
+.dv-cam-select option{background:var(--panel);color:var(--text)}
 .dv-perm{display:flex;flex-direction:column;align-items:center;gap:10px;max-width:320px}
 .dv-perm svg{width:32px;height:32px;color:var(--teal)}
 .dv-perm p{margin:0;color:var(--text)}
@@ -162,7 +164,14 @@ function useCameraPermission(enabled) {
     setStream(null);
   };
 
-  const request = async () => {
+  const [cameras, setCameras] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+
+  const open = (video) => navigator.mediaDevices.getUserMedia({ video, audio: false });
+
+  // Pass a deviceId to use a specific camera; otherwise prefers the rear camera.
+  const request = async (deviceId) => {
+    if (typeof deviceId !== "string") deviceId = undefined; // ignore click events
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus("unsupported");
       return;
@@ -170,13 +179,40 @@ function useCameraPermission(enabled) {
     setStatus("requesting");
     setError(null);
     try {
-      const s = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: {ideal: "environment" }}, // rear camera on phones
-        audio: false,
-      });
-      stop();
+      stop(); // release the current camera first; some phones can't open two at once
+      const saved = (() => { try { return localStorage.getItem("dv-camera"); } catch { return null; } })();
+      const wanted = deviceId || saved;
+      let s;
+      if (wanted) {
+        s = await open({ deviceId: { exact: wanted } }).catch(() => null);
+      }
+      if (!s) {
+        // "exact" forces the rear camera; "ideal" is often ignored and falls back to the front one.
+        s = await open({ facingMode: { exact: "environment" } }).catch((e) => {
+          if (e.name === "NotAllowedError" || e.name === "SecurityError") throw e;
+          return null; // no rear camera (e.g. laptop)
+        });
+      }
+      if (!s) s = await open(true);
+
+      // Now that permission is granted, device labels are readable.
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+      let id = s.getVideoTracks()[0]?.getSettings().deviceId;
+
+      // Some browsers still pick the front camera: switch to one labelled back/rear if there is one.
+      if (!wanted) {
+        const rear = devices.find((d) => /back|rear|environment/i.test(d.label));
+        if (rear && rear.deviceId !== id) {
+          const r = await open({ deviceId: { exact: rear.deviceId } }).catch(() => null);
+          if (r) { s.getTracks().forEach((t) => t.stop()); s = r; id = rear.deviceId; }
+        }
+      }
+
       streamRef.current = s;
       setStream(s);
+      setCameras(devices);
+      setActiveId(id);
+      if (deviceId) { try { localStorage.setItem("dv-camera", deviceId); } catch {} }
       setStatus("granted");
     } catch (e) {
       if (e.name === "NotAllowedError" || e.name === "SecurityError") {
@@ -237,7 +273,7 @@ function useCameraPermission(enabled) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
-  return { status, error, stream, request };
+  return { status, error, stream, request, cameras, activeId };
 }
 
 function VideoFeed({ videoSrc, useWebcam }) {
@@ -252,6 +288,18 @@ function VideoFeed({ videoSrc, useWebcam }) {
     return (
       <>
         <video ref={ref} autoPlay muted playsInline />
+        {cam.status === "granted" && cam.cameras.length > 1 && (
+          <select
+            className="dv-chip dv-cam-select"
+            value={cam.activeId || ""}
+            onChange={(e) => cam.request(e.target.value)}
+            aria-label="Choose camera"
+          >
+            {cam.cameras.map((c, i) => (
+              <option key={c.deviceId} value={c.deviceId}>{c.label || `Camera ${i + 1}`}</option>
+            ))}
+          </select>
+        )}
         {cam.status !== "granted" && (
           <div className="dv-empty">
             <CameraPrompt {...cam} />
